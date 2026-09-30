@@ -34,6 +34,35 @@ class EntityMAC(BasicMAC):
     def compute_allocation(self, meta_batch, t_env=None, t_ep=None, acting=False,
                            test_mode=False, calc_stats=False, target_mac=None,
                            **kwargs):
+        if self.args.hier_agent["task_allocation"] in ["ppo", "mappo"]:
+            allocs, pi_stats = self.alloc_policy.sample_allocation(meta_batch, test_mode=test_mode)
+            if self.alloc_critic.critic_condition_on_alloc:
+                values = self.alloc_critic(meta_batch, override_alloc=allocs)
+            else:
+                values = self.alloc_critic(meta_batch)
+            if calc_stats:
+                ppo_stats = {
+                    "action_seq": pi_stats["action_seq"],
+                    "actions": pi_stats.get("actions", pi_stats["action_seq"].unsqueeze(-1)),
+                    "log_probs": pi_stats.get("log_probs", pi_stats["log_prob_seq"].unsqueeze(-1)),
+                    "log_prob_seq": pi_stats["log_prob_seq"],
+                    "log_prob": pi_stats["log_prob"],
+                    "entropy": pi_stats["entropy"],
+                    "joint_entropy": pi_stats.get("joint_entropy", pi_stats["entropy"]),
+                    "agent_mask": pi_stats.get(
+                        "agent_mask",
+                        (1.0 - meta_batch["entity_mask"][:, :self.n_agents].float()).unsqueeze(-1)
+                    ),
+                    "value": values,
+                }
+                for key, value in pi_stats.items():
+                    if (key.startswith("iga_")
+                            or key.startswith("alloc_quality/")
+                            or key.startswith("alloc_counterfactual/")):
+                        ppo_stats[key] = value
+                return allocs, ppo_stats
+            return allocs
+
         all_allocs = self.alloc_policy(meta_batch, calc_stats=calc_stats, n_proposals=self.args.hier_agent['n_proposals'], test_mode=test_mode, **kwargs)
         if calc_stats:
             all_allocs, stats = all_allocs

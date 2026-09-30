@@ -44,7 +44,9 @@ def run(config, console_logger, wandb_run):
     console_logger.info("\n\n" + experiment_params + "\n")
 
     # configure tensorboard logger
-    unique_token = "{}__{}".format(args.name, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f"))
+    unique_token = args.resume_run_token or "{}__{}".format(
+        args.name, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    )
     args.unique_token = unique_token
     if args.use_tensorboard:
         tb_logs_direc = os.path.join(dirname(dirname(abspath(__file__))), "results", args.tb_dirname)
@@ -100,6 +102,40 @@ def load_run(args, wb_run, learner, runner, logger, pi_only=False):
     logger.console_logger.info(f"Loading model from run: {wb_run.name}")
     learner.load_models(model_path, evaluate=args.evaluate, pi_only=pi_only)
     runner.t_env = timestep_to_load
+
+
+def load_local_checkpoint(args, learner, runner, logger, pi_only=False):
+    checkpoint_path = os.path.expanduser(args.checkpoint_path)
+    assert checkpoint_path != "", "checkpoint_path must be provided for local checkpoint loading"
+    assert os.path.isdir(checkpoint_path), f"Local checkpoint path does not exist: {checkpoint_path}"
+
+    step_dirs = []
+    base_name = os.path.basename(os.path.normpath(checkpoint_path))
+    if base_name.isdigit():
+        step_dirs.append((int(base_name), checkpoint_path))
+    else:
+        for entry in os.listdir(checkpoint_path):
+            entry_path = os.path.join(checkpoint_path, entry)
+            if entry.isdigit() and os.path.isdir(entry_path):
+                step_dirs.append((int(entry), entry_path))
+
+    assert len(step_dirs) > 0, (
+        "No timestep checkpoint directories found under local checkpoint_path: "
+        f"{checkpoint_path}"
+    )
+
+    if args.load_step == 0:
+        timestep_to_load, model_dir = max(step_dirs, key=lambda x: x[0])
+    else:
+        timestep_to_load, model_dir = min(step_dirs, key=lambda x: abs(x[0] - args.load_step))
+
+    model_path = os.path.join(model_dir, "")
+    logger.console_logger.info(
+        "Loading local checkpoint from {} at timestep {}".format(model_dir, timestep_to_load)
+    )
+    learner.load_models(model_path, evaluate=args.evaluate, pi_only=pi_only)
+    runner.t_env = timestep_to_load
+
 
 def get_wandb_runs(checkpoint_name, wandb_api, args):
     if 'sc2' in args.env:
@@ -259,6 +295,15 @@ def run_sequential(args, logger):
             if args.hier_agent["task_allocation"] is not None or args.hier_agent["copa"]:
                 scheme["hier_decision"] = {"vshape": (1,), "dtype": th.uint8}
                 args.pre_transition_items += ['hier_decision']
+            if args.hier_agent["task_allocation"] == "ppo":
+                scheme["alloc_logprob"] = {"vshape": (1,)}
+                scheme["alloc_value"] = {"vshape": (1,)}
+            if args.hier_agent["task_allocation"] == "mappo":
+                scheme["alloc_actions"] = {"vshape": (1,), "group": "agents", "dtype": th.long}
+                scheme["alloc_logprob"] = {"vshape": (1,), "group": "agents"}
+                scheme["alloc_entropy"] = {"vshape": (1,), "group": "agents"}
+                scheme["alloc_agent_mask"] = {"vshape": (1,), "group": "agents"}
+                scheme["alloc_value"] = {"vshape": (1,)}
 
     preprocess = {
         "actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)])
@@ -281,6 +326,11 @@ def run_sequential(args, logger):
 
     if args.use_cuda:
         learner.cuda()
+
+    if args.checkpoint_path != "":
+        assert args.checkpoint_run_name == "" and args.checkpoint_unique_id == "", (
+            "Can only specify one of local checkpoint_path or wandb checkpoint options"
+        )
 
     if args.checkpoint_run_name != "" or args.checkpoint_unique_id != "":
         assert not (args.checkpoint_run_name != ""
@@ -305,7 +355,8 @@ def run_sequential(args, logger):
         elif args.checkpoint_unique_id != "":
             runs = [wandb_api.run(f'{args.wb_entity}/task-allocation/{args.checkpoint_unique_id}')]
 
-    if args.checkpoint_run_name != "" or args.checkpoint_unique_id != "" or args.env_args.get('heuristic_ai', False):
+    if (args.checkpoint_path != "" or args.checkpoint_run_name != ""
+            or args.checkpoint_unique_id != "" or args.env_args.get('heuristic_ai', False)):
         if args.evaluate or args.save_replay:
             if args.eval_path is not None:
                 os.makedirs(dirname(args.eval_path), exist_ok=True)
@@ -316,7 +367,18 @@ def run_sequential(args, logger):
                     eval_basename = ''.join(eval_basename_split) + '.json'
                 eval_filename = join(dirname(args.eval_path), eval_basename)
 
-            if args.checkpoint_run_name != "" or args.checkpoint_unique_id != "":
+            if args.checkpoint_path != "":
+                load_local_checkpoint(args, learner, runner, logger)
+                res_dict, all_subtask_infos = evaluate_sequential(args, runner, logger)
+                results = [res_dict]
+                if args.eval_path is not None:
+                    if args.eval_sep:
+                        write_struct = all_subtask_infos
+                    else:
+                        write_struct = results
+                    with open(eval_filename, 'w') as f:
+                        json.dump(write_struct, f)
+            elif args.checkpoint_run_name != "" or args.checkpoint_unique_id != "":
                 results = []
                 for i, wb_run in enumerate(runs):
                     logger.console_logger.info(f"Evaluating model {i + 1}/{len(runs)}")
@@ -340,6 +402,9 @@ def run_sequential(args, logger):
             runner.close_env()
             logger.print_stats_summary()
             return
+
+    if args.checkpoint_path != "":
+        load_local_checkpoint(args, learner, runner, logger)
 
     # start training
     episode = 0
@@ -371,7 +436,19 @@ def run_sequential(args, logger):
 
                 learner.train(episode_sample, runner.t_env, episode)
 
-                if args.hier_agent["task_allocation"] in ["aql"]:
+                if args.hier_agent["task_allocation"] == "ppo":
+                    ppo_update_interval = max(1, int(args.hier_agent.get("ppo_update_interval", 1)))
+                    # Slow-update option for high-level PPO: update every N episodes.
+                    if (episode % ppo_update_interval) != 0:
+                        continue
+                    alloc_episode_sample = episode_batch
+                    max_ep_t = alloc_episode_sample.max_t_filled()
+                    alloc_episode_sample = alloc_episode_sample[:, :max_ep_t]
+                    if alloc_episode_sample.device != args.device:
+                        alloc_episode_sample.to(args.device)
+                    learner.alloc_train_ppo(alloc_episode_sample, runner.t_env, episode)
+
+                if args.hier_agent["task_allocation"] == "aql":
                     filters = {}
                     if args.hier_agent['decay_old'] > 0:
                         cutoff = args.hier_agent['decay_old']
@@ -388,8 +465,21 @@ def run_sequential(args, logger):
                     if alloc_episode_sample.device != args.device:
                         alloc_episode_sample.to(args.device)
 
-                    elif args.hier_agent["task_allocation"] == "aql":
-                        learner.alloc_train_aql(alloc_episode_sample, runner.t_env, episode)
+                    learner.alloc_train_aql(alloc_episode_sample, runner.t_env, episode)
+
+            # MAPPO is on-policy: use each newly collected rollout once,
+            # independently of the low-level replay training iterations.
+            if args.hier_agent["task_allocation"] == "mappo":
+                ppo_update_interval = max(1, int(args.hier_agent.get("ppo_update_interval", 1)))
+                if (episode % ppo_update_interval) == 0:
+                    alloc_episode_sample = episode_batch
+                    max_ep_t = alloc_episode_sample.max_t_filled()
+                    alloc_episode_sample = alloc_episode_sample[:, :max_ep_t]
+                    if alloc_episode_sample.device != args.device:
+                        alloc_episode_sample.to(args.device)
+                    learner.alloc_train_mappo(
+                        alloc_episode_sample, runner.t_env, episode
+                    )
 
         # Execute test runs once in a while
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
@@ -447,6 +537,21 @@ def args_sanity_check(config, console_logger):
         assert (config["agent"]["subtask_cond"] is not None
                 and config["hier_agent"]["task_allocation"] is not None), (
             "Subtask-conditioning type and task allocation must be specified together")
+
+    if config["hier_agent"]["task_allocation"] == "ppo":
+        if config["hier_agent"]["alloc_policy"] in ["autoreg", "autoreg_ppo"]:
+            config["hier_agent"]["alloc_policy"] = "matching_ppo"
+        if config["hier_agent"]["alloc_critic"] == "standard":
+            config["hier_agent"]["alloc_critic"] = "ppo"
+        config["hier_agent"]["ppo_update_interval"] = max(1, int(config["hier_agent"].get("ppo_update_interval", 1)))
+
+    if config["hier_agent"]["task_allocation"] == "mappo":
+        config["hier_agent"]["alloc_policy"] = config["hier_agent"].get("alloc_policy", "mappo") or "mappo"
+        # MAPPO-style high-level allocator uses a centralized team critic.
+        # Treat "mappo" or legacy "standard" as the PPO centralized critic.
+        if config["hier_agent"]["alloc_critic"] in ["standard", "mappo"]:
+            config["hier_agent"]["alloc_critic"] = "ppo"
+        config["hier_agent"]["ppo_update_interval"] = max(1, int(config["hier_agent"].get("ppo_update_interval", 1)))
 
     # assert (config["run_mode"] in ["parallel_subproc"] and config["use_replay_buffer"]) or (not config["run_mode"] in ["parallel_subproc"]),  \
     #     "need to use replay buffer if running in parallel mode!"

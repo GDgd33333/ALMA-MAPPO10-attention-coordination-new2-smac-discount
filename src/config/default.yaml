@@ -25,12 +25,15 @@ save_model_interval: 5000 # Save models after this many timesteps
 checkpoint_run_name: "" # Load a checkpoint from best model with this manually specified name in wandb
 pi_checkpoint_run_name: "" # If provided, load the action policies from a different model (use "same" to get a different seed from a model trained with the same config)
 checkpoint_unique_id: "" # Load a checkpoint from model with this unqiue assigned ID in wandb
+checkpoint_path: "" # Load a local checkpoint dir; can point to results/models/<run> or results/models/<run>/<step>
 evaluate: False # Evaluate model for test_nepisode episodes and quit (no training)
 load_step: 0 # Load model trained on this many timesteps (0 if choose max possible)
 save_replay: False # Saving the replay of the model loaded from checkpoint_path
 video_path: # if path provided, save a video for evaluation runs
 fps: 2 # video frames per second
 tb_dirname: "tb_logs"
+resume_run_token: "" # Reuse an existing TensorBoard/model run directory when resuming locally
+resume_seed: 0 # Reuse the original random seed when resuming locally; 0 draws a new seed
 eval_all_models: False  # if True and checkpoint_run_name is provided, will evaluate *all* models with that name, rather than the best one
 eval_all_scen: False  # if True, evaluate on each separate scenario and report performance individually, otherwise randomly sample and report average performance
 eval_sep: False  # if True, store results of each episode separately w/ subtask granularity (only works for multi-subtask tasks)
@@ -75,6 +78,13 @@ hier_agent:
   prop_alloc_eps: '1.0-0.05-0.2'  # probability of sampling random *proposed* allocation
   entropy_loss: 0.01
   alloc_opt: 'rmsprop'
+  alloc_pi_lr:  # defaults to top-level lr when unset
+  alloc_q_lr:  # defaults to top-level lr when unset
+  use_discounted_return: False  # discounted high-level return branch (optional baseline)
+  use_gae: False  # if True, use high-level GAE for allocator PPO
+  gamma_high: 0.99  # per-environment-step discount for duration-aware high-level SMDP returns
+  gae_lambda: 0.95  # GAE lambda on high-level timescale
+  ppo_update_interval: 1  # high-level PPO update every N episodes (1 = same frequency as low-level training loop)
   max_bs: 400  # max batch size for alloc training (lower action_length will result in higher batch size which may overflow memory)
   pi_ag_attn: False
   subtask_mask: True

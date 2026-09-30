@@ -21,7 +21,8 @@ def get_all_unique_teams(all_types, min_len, max_len):
     return all_uniq
 
 
-def generate_scenarios(min_n_agents, max_n_agents, rs, max_diversity=True):
+def generate_scenarios(min_n_agents, max_n_agents, rs, max_diversity=True,
+                       n_buildings_offset=1):
     # we split scenarios by unique sets of agents
     # (environment will generate all possible building configurations)
     uniq_agent_teams = get_all_unique_teams(sorted(AGENT_TYPES.keys()), min_n_agents, max_n_agents)
@@ -36,7 +37,8 @@ def generate_scenarios(min_n_agents, max_n_agents, rs, max_diversity=True):
         if scen_n_types < min(n_ag_types, n_agents) and max_diversity:
             continue
 
-        scenario_list.append((agent_scenario, (n_agents + 1, n_agents + 1)))
+        n_buildings = n_agents + n_buildings_offset
+        scenario_list.append((agent_scenario, (n_buildings, n_buildings)))
     return scenario_list
 
 
@@ -82,12 +84,15 @@ def rank_mean_similarity(compare_scenarios, rank_scenarios):
 
 
 def generate_scen_dict(min_n_agents=2, max_n_agents=8, test_ratio=0.15,
-                       train_ratio=0.25, bld_spacing=7, rs=None):
+                       train_ratio=0.25, bld_spacing=7, map_size=16,
+                       n_buildings_offset=1, rs=None):
     assert bld_spacing >= 3, "Buildings must be at least 3 spaces apart"
     if rs is None:
         rs = RandomState()
 
-    all_scenarios = generate_scenarios(min_n_agents, max_n_agents, rs)
+    all_scenarios = generate_scenarios(
+        min_n_agents, max_n_agents, rs,
+        n_buildings_offset=n_buildings_offset)
     # test scenarios are always fixed if ratio is same
     n_test = int(test_ratio * len(all_scenarios))
     test_scenarios = all_scenarios[:n_test]
@@ -99,8 +104,9 @@ def generate_scen_dict(min_n_agents=2, max_n_agents=8, test_ratio=0.15,
     scenario_dict = {'train_scenarios': train_scenarios,
                      'test_scenarios': test_scenarios,
                      'max_n_agents': max_n_agents,
-                     'max_n_buildings': max_n_agents + 1,
-                     'bld_spacing': bld_spacing}
+                     'max_n_buildings': max_n_agents + n_buildings_offset,
+                     'bld_spacing': bld_spacing,
+                     'map_size': map_size}
     return scenario_dict
 
 
@@ -148,7 +154,7 @@ scenarios = {
                          test_ratio=1.0, train_ratio=None,
                          bld_spacing=3),
     '2-8a_2-8b': partial(generate_scen_dict,
-                         min_n_agents=2, max_n_agents=8,
+                         min_n_agents=2, max_ns_agents=8,
                          test_ratio=1.0, train_ratio=None,
                          bld_spacing=3),
     '2-10a_2-10b': partial(generate_scen_dict,
@@ -171,6 +177,36 @@ scenarios = {
                        min_n_agents=24, max_n_agents=24,
                        test_ratio=1.0, train_ratio=None,
                        bld_spacing=3),
+    '30a_30b': partial(generate_scen_dict,
+                       min_n_agents=30, max_n_agents=30,
+                       test_ratio=1.0, train_ratio=None,
+                       bld_spacing=3, map_size=18,
+                       n_buildings_offset=1),
+    '35a_35b': partial(generate_scen_dict,
+                       min_n_agents=35, max_n_agents=35,
+                       test_ratio=1.0, train_ratio=None,
+                       bld_spacing=3, map_size=18,
+                       n_buildings_offset=1),
+    '38a_38b': partial(generate_scen_dict,
+                       min_n_agents=38, max_n_agents=38,
+                       test_ratio=1.0, train_ratio=None,
+                       bld_spacing=3, map_size=21,
+                       n_buildings_offset=1),
+    '40a_40b': partial(generate_scen_dict,
+                       min_n_agents=40, max_n_agents=40,
+                       test_ratio=1.0, train_ratio=None,
+                       bld_spacing=3, map_size=21,
+                       n_buildings_offset=1),
+    '45a_45b': partial(generate_scen_dict,
+                       min_n_agents=45, max_n_agents=45,
+                       test_ratio=1.0, train_ratio=None,
+                       bld_spacing=3, map_size=21,
+                       n_buildings_offset=1),
+    '50a_50b': partial(generate_scen_dict,
+                       min_n_agents=50, max_n_agents=50,
+                       test_ratio=1.0, train_ratio=None,
+                       bld_spacing=3, map_size=24,
+                       n_buildings_offset=1),
     '2-8a_2-8b_sim_Q1': partial(generate_scen_dict_sim,
                                 min_n_agents=2, max_n_agents=8,
                                 test_ratio=0.15, train_pct_range=(0.0, 0.25)),
@@ -187,3 +223,20 @@ scenarios = {
                            agent_list=['F', 'F', 'F', 'B', 'B', 'B', 'G', 'G'],
                            building_list=['F', 'F', 'F', 'F', 'S', 'S', 'S', 'S'])
 }
+
+# Explicit aliases that state the true agent/building counts.
+scenarios['30-31'] = scenarios['30a_30b']
+scenarios['35-36'] = scenarios['35a_35b']
+scenarios['38-39'] = scenarios['38a_38b']
+scenarios['40-41'] = scenarios['40a_40b']
+scenarios['45-46'] = scenarios['45a_45b']
+scenarios['50-51'] = scenarios['50a_50b']
+
+# Legacy aliases kept only for compatibility with older command lines. They
+# still map to the standard n_buildings = n_agents + 1 scenarios above.
+scenarios['30-30'] = scenarios['30a_30b']
+scenarios['35-35'] = scenarios['35a_35b']
+scenarios['38-38'] = scenarios['38a_38b']
+scenarios['40-40'] = scenarios['40a_40b']
+scenarios['45-45'] = scenarios['45a_45b']
+scenarios['50-50'] = scenarios['50a_50b']

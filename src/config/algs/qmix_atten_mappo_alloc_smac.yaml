@@ -1,0 +1,75 @@
+# --- SMAC Multi-Army: QMIX + High-level MAPPO allocation with IAGA ---
+
+env: "sc2multiarmy"
+scenario: "6-8sz_maxsize4_maxarmies3_symmetric"
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 500000
+
+runner: "parallel"
+batch_size_run: 8
+training_iters: 8
+
+entity_last_action: True
+
+buffer_size: 5000
+lr: 0.00025
+
+target_update_interval: 200
+
+agent_output_type: "q"
+learner: "q_learner"
+double_q: True
+mixer: "flex_qmix"
+mixing_embed_dim: 32
+hypernet_embed: 128
+softmax_mixing_weights: True
+rnn_hidden_dim: 64
+mac: "entity_mac"
+attn_embed_dim: 128
+attn_n_heads: 4
+lmbda: 0.5
+
+agent:
+  recurrent: False
+  entity_scheme: True
+  imagine: True
+  subtask_cond: # None
+
+hier_agent:
+  task_allocation: "mappo"
+  alloc_policy: "mappo"
+  alloc_critic: "ppo"
+  critic_condition_on_alloc: False
+  action_length: 3
+  ppo_update_interval: 1
+  use_gae: True
+  use_discounted_return: False
+  gamma_high: 0.99  # per-environment-step base; each segment bootstraps with gamma_high ** segment_length
+  gae_lambda: 0.95
+  ppo_epochs: 3
+  ppo_clip: 0.1
+  ppo_value_coef: 0.5
+  ppo_entropy_coef: 0.01
+  alloc_pi_lr: 0.00025 
+  alloc_q_lr: 0.00025
+  use_agent_id: True
+  normalize_advantages: True
+
+  use_iga: True
+  iga_hidden_dim: 64
+  iga_num_heads: 2
+  iga_delta_scale: 0.1
+  iga_center_delta: True
+  iga_use_agent_graph: True
+  iga_use_task_graph: True
+  # False keeps both homogeneous graphs but replaces explicit Agent-Task
+  # edge features with an agent-wise non-relational residual MLP.
+  iga_use_agent_task_graph: True
+  iga_use_task_load: True
+  iga_dropout: 0.0
+  iga_debug_checks: False
+
+name: "qmix_atten_mappo_alloc_smac"

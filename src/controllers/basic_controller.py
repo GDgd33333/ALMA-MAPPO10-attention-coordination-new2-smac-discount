@@ -10,7 +10,9 @@ class BasicMAC:
     def __init__(self, scheme, groups, args):
         self.n_agents = args.n_agents
         self.args = args
-        self.learned_alloc = args.hier_agent['task_allocation'] == 'aql'
+        self.learned_alloc = args.hier_agent['task_allocation'] in ['aql', 'ppo', 'mappo']
+        self.ppo_alloc = args.hier_agent['task_allocation'] in ['ppo', 'mappo']
+        self.mappo_alloc = args.hier_agent['task_allocation'] == 'mappo'
         self.heuristic_alloc = args.hier_agent['task_allocation'] == 'heuristic'
         self.random_alloc = args.hier_agent['task_allocation'] in ['random', 'random_fixed']
         self.use_alloc = args.hier_agent['task_allocation'] is not None
@@ -35,7 +37,23 @@ class BasicMAC:
                     # only update task allocation if at any decision points
                     if self.learned_alloc:
                         meta_batch = self._make_meta_batch(ep_batch, t_ep)
-                        new_allocs = self.compute_allocation(meta_batch, t_ep=t_ep, t_env=t_env, acting=True, test_mode=test_mode)
+                        if self.ppo_alloc:
+                            new_allocs, alloc_info = self.compute_allocation(
+                                meta_batch, t_ep=t_ep, t_env=t_env, acting=True,
+                                test_mode=test_mode, calc_stats=True
+                            )
+                            if decision_pts.sum() > 0 and "alloc_logprob" in ep_batch.scheme:
+                                d_inds = (decision_pts == 1)
+                                if self.mappo_alloc:
+                                    ep_batch.data.transition_data["alloc_actions"][d_inds, t_ep] = alloc_info["actions"].detach().long()
+                                    ep_batch.data.transition_data["alloc_logprob"][d_inds, t_ep] = alloc_info["log_probs"].detach()
+                                    ep_batch.data.transition_data["alloc_entropy"][d_inds, t_ep] = alloc_info["entropy"].detach()
+                                    ep_batch.data.transition_data["alloc_agent_mask"][d_inds, t_ep] = alloc_info["agent_mask"].detach()
+                                else:
+                                    ep_batch.data.transition_data["alloc_logprob"][d_inds, t_ep] = alloc_info["log_prob"].detach()
+                                ep_batch.data.transition_data["alloc_value"][d_inds, t_ep] = alloc_info["value"].detach()
+                        else:
+                            new_allocs = self.compute_allocation(meta_batch, t_ep=t_ep, t_env=t_env, acting=True, test_mode=test_mode)
                     elif self.heuristic_alloc:
                         # heuristic is computed at every step in the env and stored in entity2task_mask
                         new_allocs = 1 - ep_batch['entity2task_mask'][:, t_ep, :self.n_agents][decision_pts == 1]

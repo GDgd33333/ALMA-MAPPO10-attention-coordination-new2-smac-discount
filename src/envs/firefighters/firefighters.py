@@ -8,7 +8,8 @@ from ..multiagentenv import MultiAgentEnv
 
 
 class Render(object):
-    def __init__(self, figsize=(15, 15), dpi=48):
+    def __init__(self, map_size, figsize=(15, 15), dpi=48):
+        self.map_size = map_size
         self.figsize = figsize
         self.dpi = dpi
         self.fig = Figure(figsize=figsize, dpi=dpi)
@@ -25,8 +26,8 @@ class Render(object):
         for artist in self.artists:
             artist.remove()
         self.artists = []
-        self.ax.set_xlim(-0.1, MAP_SIZE + 1.1)
-        self.ax.set_ylim(-0.1, MAP_SIZE + 1.1)
+        self.ax.set_xlim(-0.1, self.map_size + 1.1)
+        self.ax.set_ylim(-0.1, self.map_size + 1.1)
         self.ax.axis('off')
 
     def draw(self):
@@ -278,9 +279,18 @@ class FireFightersEnv(MultiAgentEnv):
             self.max_n_agents = scenario_dict['max_n_agents']
             self.max_n_buildings = scenario_dict['max_n_buildings']
             self.bld_spacing = scenario_dict['bld_spacing']
+        self.map_size = (MAP_SIZE if scenario_dict == 'infinite'
+                         else scenario_dict.get('map_size', MAP_SIZE))
 
-        self.bld_pos_candidates = list(product(range(1, MAP_SIZE, self.bld_spacing),
-                                               range(1, MAP_SIZE, self.bld_spacing)))
+        self.bld_pos_candidates = list(
+            product(range(1, self.map_size, self.bld_spacing),
+                    range(1, self.map_size, self.bld_spacing)))
+        if len(self.bld_pos_candidates) < self.max_n_buildings:
+            raise ValueError(
+                "Map size {} with building spacing {} provides only {} "
+                "building positions, but the scenario requires {}.".format(
+                    self.map_size, self.bld_spacing,
+                    len(self.bld_pos_candidates), self.max_n_buildings))
 
         self.episode_limit = episode_limit
         self.end_on_any_burn = end_on_any_burn
@@ -313,7 +323,7 @@ class FireFightersEnv(MultiAgentEnv):
         self._render = None
         self.time = 0
         self.seed(seed)
-        self.grid = np.array([[None for _ in range(MAP_SIZE)] for _ in range(MAP_SIZE)])
+        self.grid = np.full((self.map_size, self.map_size), None, dtype=object)
         self.agents = []
         self.buildings = []
 
@@ -324,20 +334,20 @@ class FireFightersEnv(MultiAgentEnv):
     def _vis_objs(self, x, y, vis_range):
         gridcopy = self.grid.copy()
         min_x = max(0, x - vis_range)
-        max_x = min(MAP_SIZE, x + vis_range + 1)
+        max_x = min(self.map_size, x + vis_range + 1)
         min_y = max(0, y - vis_range)
-        max_y = min(MAP_SIZE, y + vis_range + 1)
+        max_y = min(self.map_size, y + vis_range + 1)
         local_region = gridcopy[min_x:max_x, min_y:max_y].flatten().tolist()
         return [obj for obj in local_region if obj is not None]
 
     def _get_dir_obj(self, x, y, direction, dist=1):
         if direction == 'N':
-            if y + dist >= MAP_SIZE:
+            if y + dist >= self.map_size:
                 return 'boundary'
             else:
                 return self.grid[x, y + dist]
         elif direction == 'E':
-            if x + dist >= MAP_SIZE:
+            if x + dist >= self.map_size:
                 return 'boundary'
             else:
                 return self.grid[x + dist, y]
@@ -421,7 +431,8 @@ class FireFightersEnv(MultiAgentEnv):
 
         self.time = 0
 
-        agt_pos_grid = np.array([[None for _ in range(MAP_SIZE)] for _ in range(MAP_SIZE)])
+        agt_pos_grid = np.full(
+            (self.map_size, self.map_size), None, dtype=object)
 
         obj_id = 0
 
@@ -485,12 +496,12 @@ class FireFightersEnv(MultiAgentEnv):
             ind += len(BUILDING_TYPES) + len(AGENT_TYPES)
             # one-hot x-y loc
             curr_ent[ind + obj.x] = 1
-            ind += MAP_SIZE
+            ind += self.map_size
             curr_ent[ind + obj.y] = 1
-            ind += MAP_SIZE
+            ind += self.map_size
             # scalar x-y loc
-            curr_ent[ind] = obj.x / MAP_SIZE
-            curr_ent[ind + 1] = obj.y / MAP_SIZE
+            curr_ent[ind] = obj.x / self.map_size
+            curr_ent[ind + 1] = obj.y / self.map_size
             ind += 2
             # avail actions
             if obj.ent_type == 'agent':
@@ -524,7 +535,7 @@ class FireFightersEnv(MultiAgentEnv):
         # entity type
         nf_entity += len(AGENT_TYPES) + len(BUILDING_TYPES)
         # one-hot location coordinates
-        nf_entity += 2 * MAP_SIZE
+        nf_entity += 2 * self.map_size
         # scalar location coordinates
         nf_entity += 2
         # available actions (only for agents)
@@ -827,7 +838,7 @@ class FireFightersEnv(MultiAgentEnv):
 
         action_dict = {'F': 'aqua', 'B': 'lime', 'Z': 'tomato'}
 
-        bg = plt.Rectangle((0, 0), MAP_SIZE + 1, MAP_SIZE + 1,
+        bg = plt.Rectangle((0, 0), self.map_size + 1, self.map_size + 1,
                            linewidth=5, edgecolor='black', facecolor='white',
                            fill=True, zorder=1.3, alpha=1.0)
         self._render.add_artist(bg)
@@ -908,5 +919,5 @@ class FireFightersEnv(MultiAgentEnv):
 
     def init_render(self):
         if self._render is None:
-            self._render = Render()
+            self._render = Render(self.map_size)
         return self

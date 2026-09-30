@@ -44,10 +44,24 @@ class QLearner:
             self.params += list(self.mixer.parameters())
             self.target_mixer = copy.deepcopy(self.mixer)
 
-        self.optimiser = RMSprop(params=self.params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps,
+        low_lr = args.lr
+        self.optimiser = RMSprop(params=self.params, lr=low_lr, alpha=args.optim_alpha, eps=args.optim_eps,
                                  weight_decay=args.weight_decay)
 
-        if self.args.hier_agent["task_allocation"] == "aql":
+        alloc_pi_lr = None
+        alloc_q_lr = None
+        if self.args.hier_agent["task_allocation"] in ["aql", "ppo", "mappo"]:
+            alloc_pi_lr = self.args.hier_agent.get("alloc_pi_lr", None)
+            alloc_q_lr = self.args.hier_agent.get("alloc_q_lr", None)
+            if alloc_pi_lr is None:
+                alloc_pi_lr = args.lr
+            else:
+                alloc_pi_lr = float(alloc_pi_lr)
+            if alloc_q_lr is None:
+                alloc_q_lr = args.lr
+            else:
+                alloc_q_lr = float(alloc_q_lr)
+
             self.alloc_pi_params = list(mac.alloc_pi_params())
             if self.args.hier_agent["alloc_opt"] == "rmsprop":
                 OptClass = partial(RMSprop, alpha=args.optim_alpha)
@@ -56,18 +70,66 @@ class QLearner:
             else:
                 raise Exception("Optimizer not recognized")
             self.alloc_pi_optimiser = OptClass(
-                params=self.alloc_pi_params, lr=args.lr, eps=args.optim_eps,
+                params=self.alloc_pi_params, lr=alloc_pi_lr, eps=args.optim_eps,
                 weight_decay=args.weight_decay)
             self.alloc_q_params = list(mac.alloc_q_params())
             self.alloc_q_optimiser = OptClass(
-                params=self.alloc_q_params, lr=args.lr, eps=args.optim_eps,
+                params=self.alloc_q_params, lr=alloc_q_lr, eps=args.optim_eps,
                 weight_decay=args.alloc_q_weight_decay)
+
+            if self.args.hier_agent["task_allocation"] in ["ppo", "mappo"]:
+                critic_mode = (
+                    "allocation-conditioned C(s,Z)"
+                    if self.mac.alloc_critic.critic_condition_on_alloc
+                    else "state-only V(s)"
+                )
+                self.logger.console_logger.info(
+                    "High-level critic mode: {} (input_dim={})".format(
+                        critic_mode, self.mac.alloc_critic.critic_in_dim
+                    )
+                )
+
+        # Print LR config once at startup to verify decoupled settings.
+        self.logger.console_logger.info("[LR CONFIG]")
+        self.logger.console_logger.info("low-level lr = {}".format(low_lr))
+        if self.args.hier_agent["task_allocation"] in ["aql", "ppo", "mappo"]:
+            self.logger.console_logger.info("alloc_pi_lr = {}".format(alloc_pi_lr))
+            self.logger.console_logger.info("alloc_q_lr = {}".format(alloc_q_lr))
 
         # a little wasteful to deepcopy (e.g. duplicates action selector), but should work for any MAC
         self.target_mac = copy.deepcopy(mac)
 
         self.log_stats_t = -self.args.learner_log_interval - 1
         self.log_alloc_stats_t = -self.args.learner_log_interval - 1
+        self._logged_high_adv_cfg = False
+
+    def _build_highlevel_discounted_returns(self, seg_rewards, segment_discounts, decision_points, seg_terminated):
+        returns = th.zeros_like(seg_rewards)
+        running_return = th.zeros_like(seg_rewards[:, 0])
+        for t in reversed(range(seg_rewards.shape[1])):
+            is_decision = decision_points[:, t].float()
+            running_return = running_return * (1 - seg_terminated[:, t])
+            curr_return = seg_rewards[:, t] + segment_discounts[:, t] * running_return
+            running_return = is_decision * curr_return + (1 - is_decision) * running_return
+            returns[:, t] = running_return * is_decision
+        return returns
+
+    def _build_highlevel_gae(self, seg_rewards, seg_values, segment_discounts, decision_points, seg_terminated, gae_lambda):
+        advantages = th.zeros_like(seg_rewards)
+        returns = th.zeros_like(seg_rewards)
+        running_adv = th.zeros_like(seg_rewards[:, 0])
+        next_value = th.zeros_like(seg_rewards[:, 0])
+        for t in reversed(range(seg_rewards.shape[1])):
+            is_decision = decision_points[:, t].float()
+            v_t = seg_values[:, t]
+            duration_discount = segment_discounts[:, t]
+            delta_t = seg_rewards[:, t] + duration_discount * next_value * (1 - seg_terminated[:, t]) - v_t
+            curr_adv = delta_t + duration_discount * gae_lambda * (1 - seg_terminated[:, t]) * running_adv
+            running_adv = is_decision * curr_adv + (1 - is_decision) * running_adv
+            advantages[:, t] = running_adv * is_decision
+            returns[:, t] = (advantages[:, t] + v_t) * is_decision
+            next_value = is_decision * v_t + (1 - is_decision) * next_value
+        return advantages, returns
 
     def _get_mixer_ins(self, batch):
         if not self.args.entity_scheme:
@@ -102,6 +164,8 @@ class QLearner:
         mask = batch['filled'].float()
         allocs = 1 - batch['entity2task_mask'][:, :, :self.args.n_agents].float()
         mask[:, 1:] = mask[:, 1:] * (1 - reset[:, :-1])
+        # Preserve the valid low-level transitions before timeout masking.
+        transition_mask = mask.clone()
         bs, ts, _ = mask.shape
         t_added = batch['t_added'].reshape(bs, 1, 1).repeat(1, ts, 1)
 
@@ -111,15 +175,28 @@ class QLearner:
 
         seg_rewards = th.zeros_like(reward)
         cuml_rewards = th.zeros_like(reward[:, 0])
+        seg_lengths = th.zeros_like(reward)
+        cuml_lengths = th.zeros_like(reward[:, 0])
         seg_terminated = th.zeros_like(terminated)
         cuml_terminated = th.zeros_like(terminated[:, 0])
         cuml_timeout = th.zeros_like(timeout[:, 0])
+        # gamma_high is the per-environment-step discount used by the
+        # high-level SMDP return. A segment of length L bootstraps with
+        # gamma_high ** L rather than one fixed discount per segment.
+        gamma_high = float(self.args.hier_agent.get("gamma_high", 0.99))
 
         for t in reversed(range(reward.shape[1])):
-            # sum rewards between hierarchical decision points
-            cuml_rewards += reward[:, t]
+            # Discount rewards inside each high-level segment:
+            # r_t + gamma_high*r_{t+1} + ... + gamma_high**(L-1)*r_{t+L-1}.
+            cuml_rewards = (
+                reward[:, t] * transition_mask[:, t]
+                + gamma_high * cuml_rewards
+            )
+            cuml_lengths += transition_mask[:, t]
             seg_rewards[:, t] = cuml_rewards
+            seg_lengths[:, t] = cuml_lengths
             cuml_rewards *= 1 - decision_points[:, t]
+            cuml_lengths *= 1 - decision_points[:, t]
 
             # track whether env terminated between decision points
             cuml_terminated = cuml_terminated.max(terminated[:, t])
@@ -131,8 +208,32 @@ class QLearner:
             mask[:, t] *= (1 - cuml_timeout)
             cuml_timeout *= 1 - decision_points[:, t]
 
-        # scale by action length to keep gradients around same magnitude as low-level controllers
-        seg_rewards /= self.args.hier_agent['action_length']
+        # Duration-aware bootstrap discount for the SMDP transition.
+        segment_discounts = th.pow(
+            seg_rewards.new_tensor(gamma_high), seg_lengths
+        )
+        seg_advantages = None
+        seg_returns = seg_rewards.clone()
+        use_gae = self.args.hier_agent.get("use_gae", False)
+        use_discounted_return = self.args.hier_agent.get("use_discounted_return", False)
+        if use_gae and 'alloc_value' in batch:
+            gae_lambda = float(self.args.hier_agent.get("gae_lambda", 0.95))
+            seg_values = batch['alloc_value'].clone()
+            seg_advantages, seg_returns = self._build_highlevel_gae(
+                seg_rewards=seg_rewards,
+                seg_values=seg_values,
+                segment_discounts=segment_discounts,
+                decision_points=decision_points,
+                seg_terminated=seg_terminated,
+                gae_lambda=gae_lambda,
+            )
+        elif use_discounted_return:
+            seg_returns = self._build_highlevel_discounted_returns(
+                seg_rewards=seg_rewards,
+                segment_discounts=segment_discounts,
+                decision_points=decision_points,
+                seg_terminated=seg_terminated,
+            )
 
         last_alloc = th.zeros_like(allocs)
         was_reset = th.zeros_like(reset[:, [0]])
@@ -157,6 +258,9 @@ class QLearner:
         max_bs = self.args.hier_agent['max_bs']
         meta_batch = {
             'reward': seg_rewards[d_inds][:max_bs],
+            'segment_length': seg_lengths[d_inds][:max_bs],
+            'segment_discount': segment_discounts[d_inds][:max_bs],
+            'return': seg_returns[d_inds][:max_bs],
             'terminated': seg_terminated[d_inds][:max_bs],
             'mask': mask[d_inds][:max_bs],
             'entities': batch['entities'][d_inds][:max_bs],
@@ -168,7 +272,476 @@ class QLearner:
             'last_alloc': last_alloc[d_inds][:max_bs],
             't_added': t_added[d_inds][:max_bs],
         }
+        if 'alloc_logprob' in batch:
+            meta_batch['alloc_logprob'] = batch['alloc_logprob'][d_inds][:max_bs]
+        if 'alloc_actions' in batch:
+            meta_batch['alloc_actions'] = batch['alloc_actions'][d_inds][:max_bs]
+        if 'alloc_entropy' in batch:
+            meta_batch['alloc_entropy'] = batch['alloc_entropy'][d_inds][:max_bs]
+        if 'alloc_agent_mask' in batch:
+            meta_batch['alloc_agent_mask'] = batch['alloc_agent_mask'][d_inds][:max_bs]
+        if 'alloc_value' in batch:
+            meta_batch['alloc_value'] = batch['alloc_value'][d_inds][:max_bs]
+        if seg_advantages is not None:
+            meta_batch['advantage'] = seg_advantages[d_inds][:max_bs]
         return meta_batch
+
+    def alloc_train_ppo(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+        """
+        高层 PPO allocator 的训练函数。
+
+        作用：
+        1. 从完整 episode batch 中抽取“高层决策点”对应的 meta_batch
+        2. 读取 rollout 时存下来的旧 log_prob、旧 value、旧 allocation
+        3. 用当前策略重新评估这些旧动作，得到 new_log_prob / entropy / value_pred
+        4. 按 PPO 的 clipped objective 更新高层 actor
+        5. 用 MSE 更新高层 critic
+        6. 记录训练统计量
+
+        参数：
+        - batch: 一个完整的 episode batch（通常包含低层每一步的数据）
+        - t_env: 当前全局训练步数，用于日志记录
+        - episode_num: 当前 episode 编号（这里没有直接用，但接口保留）
+        """
+
+        # ------------------------------------------
+        # 第一步：从完整的 low-level batch 中提取高层决策点对应的数据
+        # ------------------------------------------
+        # 这个函数通常会把“每 K 步一次”的高层决策点筛出来，
+        # 形成一个只用于高层训练的 meta_batch。
+        meta_batch = self._make_meta_batch(batch)
+
+        # 如果当前没有任何高层决策样本，就直接返回空字典
+        # 这种情况可能发生在：episode 太短、没有触发高层决策点等
+        if meta_batch["reward"].shape[0] == 0:
+            return {}
+
+        # ------------------------------------------
+        # 第二步：取出高层 PPO 训练所需的基本字段
+        # ------------------------------------------
+
+        # 高层 reward，通常是“两个高层决策点之间累计的环境奖励”
+        # 形状一般是 (n_meta_steps, 1) 或 (bs_meta, 1)
+        rewards = meta_batch["reward"]
+
+        # mask 用于表示哪些高层决策样本是有效的
+        # 比如 episode 结束后的 padding 样本通常要 mask 掉
+        mask = meta_batch["mask"]
+
+        # 把 mask 扩展成和 rewards 一样的形状，方便后面逐元素乘
+        # 例如 rewards 是 (N, 1)，那 active_mask 也会是 (N, 1)
+        active_mask = mask.expand_as(rewards)
+
+        use_gae = self.args.hier_agent.get("use_gae", False)
+        use_discounted_return = self.args.hier_agent.get("use_discounted_return", False)
+        gamma_high = float(self.args.hier_agent.get("gamma_high", 0.99))
+        gae_lambda = float(self.args.hier_agent.get("gae_lambda", 0.95))
+        if not self._logged_high_adv_cfg:
+            self.logger.console_logger.info(
+                "[HIGH PPO ADV CONFIG] use_gae={} use_discounted_return={} gamma_high_per_env_step={} gae_lambda={}".format(
+                    use_gae, use_discounted_return, gamma_high, gae_lambda
+                )
+            )
+            self._logged_high_adv_cfg = True
+        returns = meta_batch.get("return", rewards).detach()
+
+        # ------------------------------------------
+        # 第三步：读取 rollout 时行为策略留下来的旧统计量
+        # ------------------------------------------
+
+        # old_log_prob：
+        # rollout 时，高层行为策略（旧策略）对那次 allocation 的总 log_prob
+        # detach 的目的是：训练当前策略时，不让梯度回到旧 rollout 图里
+        old_log_prob = meta_batch["alloc_logprob"].detach()
+
+        # old_value：
+        # rollout 时，critic 对那次高层决策给出的 value 预测
+        # 同样 detach，作为旧基线使用
+        old_value = meta_batch["alloc_value"].detach()
+
+        # ------------------------------------------
+        # 第四步：构造 advantage
+        # ------------------------------------------
+
+        # 目前 advantage 的简化写法：
+        # advantage = return - old_value
+        #
+        # 含义：
+        # - 如果实际回报比旧 value 高，说明这次分配比预期好，advantage 为正
+        # - 如果实际回报比旧 value 低，说明这次分配比预期差，advantage 为负
+        if use_gae and "advantage" in meta_batch:
+            advantages = meta_batch["advantage"].detach()
+        else:
+            advantages = returns - old_value
+
+        # advantage 的 mask，和 active_mask 形状对齐
+        adv_mask = active_mask.expand_as(advantages)
+
+        # 计算被 mask 后的 advantage 均值
+        # 只在有效样本上统计
+        adv_mean = (advantages * adv_mask).sum() / adv_mask.sum().clamp_min(1.0)
+
+        # 计算被 mask 后的 advantage 方差
+        # 也是只在有效样本上统计
+        adv_var = (((advantages - adv_mean) * adv_mask) ** 2).sum() / adv_mask.sum().clamp_min(1.0)
+
+        # 对 advantage 做标准化
+        # 这是 PPO 中很常见的做法，有助于训练稳定
+        advantages = (advantages - adv_mean) / (adv_var.sqrt() + 1e-8)
+
+        # ------------------------------------------
+        # 第五步：从 allocation 恢复 action_seq
+        # ------------------------------------------
+
+        # meta_batch["entity2task_mask"] 里前 n_agents 行对应 agent 到 task 的 one-hot/反mask关系
+        # 原始 mask 语义通常是：1 表示“不属于 task”，0 表示“属于 task”
+        # 所以这里取反后得到 one-hot allocation
+        alloc_onehot = 1 - meta_batch["entity2task_mask"][:, :self.args.n_agents].float()
+
+        # action_seq 是整数形式的 task id 序列
+        # 例如 one-hot [0,0,1,0] -> argmax 后变成 task id = 2
+        #
+        # 之所以需要 action_seq，是因为 evaluate_actions() 里要逐 agent 回放旧动作
+        action_seq = alloc_onehot.argmax(dim=-1)
+
+        # ------------------------------------------
+        # 第六步：读取 PPO 的训练超参数
+        # ------------------------------------------
+
+        # PPO clip 范围，默认 0.2
+        eps_clip = self.args.hier_agent.get("ppo_clip", 0.2)
+
+        # critic loss 的权重系数
+        value_coef = self.args.hier_agent.get("ppo_value_coef", 0.5)
+
+        # entropy 正则项的权重系数
+        entropy_coef = self.args.hier_agent.get("ppo_entropy_coef", 0.01)
+
+        # 每次高层 PPO 更新要做多少个 epoch
+        ppo_epochs = int(self.args.hier_agent.get("ppo_epochs", 4))
+
+        # 训练统计量字典，后面会往里面写 loss、KL、clip fraction 等
+        stats = {}
+
+        # ------------------------------------------
+        # 第七步：进行多轮 PPO epoch 更新
+        # ------------------------------------------
+        for _ in range(ppo_epochs):
+
+            # 用当前策略重新评估 rollout 时执行过的旧 action_seq
+            # evaluate_actions 的作用是：
+            # - 不重新采样动作
+            # - 而是按旧 action_seq 回放
+            # - 算出当前策略下这些旧动作的 new_log_prob 和 entropy
+            pi_eval = self.mac.alloc_policy.evaluate_actions(meta_batch, action_seq)
+
+            # 当前策略对整张 allocation 的总 log_prob
+            # 用于和 old_log_prob 做 ratio
+            new_log_prob = pi_eval["log_prob"]
+
+            # 当前策略下的 entropy（通常是整张 allocation 序列的总 entropy）
+            entropy = pi_eval["entropy"]
+
+            # State-only V(s) is the default. The allocation is supplied only
+            # for controlled runs using the legacy allocation-conditioned C(s, Z).
+            if self.mac.alloc_critic.critic_condition_on_alloc:
+                value_pred = self.mac.alloc_critic(meta_batch, override_alloc=alloc_onehot)
+            else:
+                value_pred = self.mac.alloc_critic(meta_batch)
+
+            # --------------------------------------
+            # 第八步：PPO actor 部分
+            # --------------------------------------
+
+            # PPO 核心比值：
+            # ratio = π_new(a|s) / π_old(a|s)
+            # 因为存的是 log_prob，所以用 exp(new - old)
+            ratio = th.exp(new_log_prob - old_log_prob)
+
+            # PPO surrogate objective 第一项
+            # 如果 ratio 不大，就直接按 ratio * advantage 来更新
+            surr1 = ratio * advantages
+
+            # PPO surrogate objective 第二项
+            # 把 ratio 限制在 [1-eps, 1+eps] 区间内
+            # 防止策略更新太猛
+            surr2 = th.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * advantages
+
+            # actor loss 的逐样本形式
+            # PPO 取 min(surr1, surr2)，再取负号做梯度下降
+            actor_loss_t = -th.min(surr1, surr2)
+
+            # 只在有效样本上平均 actor loss
+            actor_loss = (actor_loss_t * active_mask).sum() / active_mask.sum().clamp_min(1.0)
+
+            # --------------------------------------
+            # 第九步：critic 部分
+            # --------------------------------------
+
+            # critic 的 MSE 误差
+            # 当前实现里 target 就是 returns（简化版本）
+            value_err = (value_pred - returns) ** 2
+
+            # 同样只在有效样本上平均
+            critic_loss = (value_err * active_mask).sum() / active_mask.sum().clamp_min(1.0)
+
+            # --------------------------------------
+            # 第十步：entropy 正则
+            # --------------------------------------
+
+            # entropy 也只在有效样本上平均
+            entropy_mean = (entropy * active_mask).sum() / active_mask.sum().clamp_min(1.0)
+
+            # 高层 actor 的总损失
+            # = actor_loss - entropy_coef * entropy
+            # 这里减 entropy 是因为我们希望在优化时鼓励更高熵（保持探索）
+            pi_loss = actor_loss - entropy_coef * entropy_mean
+
+            # critic 的总损失
+            # = value_coef * critic_loss
+            q_loss = value_coef * critic_loss
+
+            # --------------------------------------
+            # 第十一步：更新高层 actor 参数
+            # --------------------------------------
+
+            # 清空 actor 优化器里的旧梯度
+            self.alloc_pi_optimiser.zero_grad()
+
+            # 反向传播 actor loss
+            pi_loss.backward()
+
+            # 做梯度裁剪，防止梯度爆炸
+            # 返回值是裁剪前的梯度范数
+            pi_grad_norm = th.nn.utils.clip_grad_norm_(self.alloc_pi_params, self.args.grad_norm_clip)
+
+            # actor 参数更新一步
+            self.alloc_pi_optimiser.step()
+
+            # --------------------------------------
+            # 第十二步：更新高层 critic 参数
+            # --------------------------------------
+
+            # 清空 critic 优化器里的旧梯度
+            self.alloc_q_optimiser.zero_grad()
+
+            # 反向传播 critic loss
+            q_loss.backward()
+
+            # critic 梯度裁剪
+            q_grad_norm = th.nn.utils.clip_grad_norm_(self.alloc_q_params, self.args.grad_norm_clip)
+
+            # critic 参数更新一步
+            self.alloc_q_optimiser.step()
+
+        # ------------------------------------------
+        # 第十三步：在 no_grad 下统计一些训练诊断量
+        # ------------------------------------------
+        with th.no_grad():
+
+            # 近似 KL：
+            # 这里用 (old_log_prob - new_log_prob) 的平均来做一个简化近似
+            # 用于监控当前策略相对旧策略偏移了多少
+            approx_kl = ((old_log_prob - new_log_prob) * active_mask).sum() / active_mask.sum().clamp_min(1.0)
+
+            # clip fraction：
+            # 看有多少样本的 ratio 超出了 clip 区间
+            # 这是 PPO 一个很常用的训练健康度指标
+            clip_frac = ((th.abs(ratio - 1.0) > eps_clip).float() * active_mask).sum() / active_mask.sum().clamp_min(1.0)
+
+            # 记录 actor loss
+            stats["losses/alloc_ppo_actor"] = actor_loss.item()
+
+            # 记录 critic loss
+            stats["losses/alloc_ppo_critic"] = critic_loss.item()
+
+            # 记录平均 entropy
+            stats["losses/alloc_ppo_entropy"] = entropy_mean.item()
+            stats["alloc_metrics/return_target_mean"] = ((returns * active_mask).sum() / active_mask.sum().clamp_min(1.0)).item()
+
+            # 记录近似 KL
+            stats["alloc_metrics/alloc_kl"] = approx_kl.item()
+
+            # 记录 clip 比例
+            stats["alloc_metrics/alloc_clip_frac"] = clip_frac.item()
+
+            # 记录 actor 梯度范数
+            stats["train_metrics/alloc_pi_grad_norm"] = pi_grad_norm
+
+            # 记录 critic 梯度范数
+            stats["train_metrics/alloc_q_grad_norm"] = q_grad_norm
+
+        # ------------------------------------------
+        # 第十四步：按日志间隔写日志
+        # ------------------------------------------
+
+        # 只有当距离上次记录已经超过 learner_log_interval 时，才写日志
+        if t_env - self.log_alloc_stats_t >= self.args.learner_log_interval:
+
+            # 把 stats 里的每一项写入 logger
+            for name, value in stats.items():
+                self.logger.log_stat(name, value, t_env)
+
+            # 更新上次记录日志的时间戳
+            self.log_alloc_stats_t = t_env
+
+        # 返回本次 PPO 更新的统计结果
+        return stats
+
+    def alloc_train_mappo(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+        """Train MAPPO-style high-level allocator with per-agent PPO ratios."""
+        meta_batch = self._make_meta_batch(batch)
+        if meta_batch["reward"].shape[0] == 0:
+            return {}
+
+        rewards = meta_batch["reward"]
+        mask = meta_batch["mask"]
+        active_mask = mask.expand_as(rewards)
+        returns = meta_batch.get("return", rewards).detach()
+
+        use_gae = self.args.hier_agent.get("use_gae", False)
+        use_discounted_return = self.args.hier_agent.get("use_discounted_return", False)
+        gamma_high = float(self.args.hier_agent.get("gamma_high", 0.99))
+        gae_lambda = float(self.args.hier_agent.get("gae_lambda", 0.95))
+        if not self._logged_high_adv_cfg:
+            self.logger.console_logger.info(
+                "[HIGH MAPPO ADV CONFIG] use_gae={} use_discounted_return={} gamma_high_per_env_step={} gae_lambda={}".format(
+                    use_gae, use_discounted_return, gamma_high, gae_lambda
+                )
+            )
+            self._logged_high_adv_cfg = True
+
+        old_log_probs = meta_batch["alloc_logprob"].detach()
+        old_value = meta_batch["alloc_value"].detach()
+        if use_gae and "advantage" in meta_batch:
+            advantages = meta_batch["advantage"].detach()
+        else:
+            advantages = returns - old_value
+
+        adv_mask = active_mask.expand_as(advantages)
+        adv_mean = (advantages * adv_mask).sum() / adv_mask.sum().clamp_min(1.0)
+        adv_var = (((advantages - adv_mean) * adv_mask) ** 2).sum() / adv_mask.sum().clamp_min(1.0)
+        if self.args.hier_agent.get("normalize_advantages", True):
+            advantages = (advantages - adv_mean) / (adv_var.sqrt() + 1e-8)
+
+        alloc_actions = meta_batch["alloc_actions"].long()
+        if alloc_actions.dim() == 2:
+            alloc_actions = alloc_actions.unsqueeze(-1)
+        # Reconstruct all fixed agent slots, then remove agents that were
+        # already inactive when this high-level decision was made.
+        alloc_onehot_unmasked = F.one_hot(
+            alloc_actions.squeeze(-1), num_classes=self.args.n_tasks
+        ).float()
+
+        if "alloc_agent_mask" in meta_batch:
+            agent_mask = meta_batch["alloc_agent_mask"].float()
+        else:
+            agent_mask = (1.0 - meta_batch["entity_mask"][:, :self.args.n_agents].float()).unsqueeze(-1)
+        valid_agent_mask = agent_mask * active_mask.unsqueeze(1)
+        alloc_onehot = alloc_onehot_unmasked * agent_mask
+
+        eps_clip = self.args.hier_agent.get("ppo_clip", 0.2)
+        value_coef = self.args.hier_agent.get(
+            "ppo_value_coef", self.args.hier_agent.get("value_coef", 0.5))
+        entropy_coef = self.args.hier_agent.get("ppo_entropy_coef", 0.01)
+        ppo_epochs = int(self.args.hier_agent.get("ppo_epochs", 4))
+
+        stats = {}
+        for _ in range(ppo_epochs):
+            pi_eval = self.mac.alloc_policy.evaluate_actions(meta_batch, alloc_actions)
+            new_log_probs = pi_eval["log_probs"]
+            entropy = pi_eval["entropy"]
+            if self.mac.alloc_critic.critic_condition_on_alloc:
+                value_pred = self.mac.alloc_critic(meta_batch, override_alloc=alloc_onehot)
+            else:
+                value_pred = self.mac.alloc_critic(meta_batch)
+
+            ratio = th.exp(new_log_probs - old_log_probs)
+            adv_agent = advantages.unsqueeze(1).expand_as(ratio)
+            surr1 = ratio * adv_agent
+            surr2 = th.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * adv_agent
+            actor_loss_per_agent = -th.min(surr1, surr2) * valid_agent_mask
+
+            # Standard MAPPO reduction: average over all valid agent decisions.
+            # This keeps the actor scale independent of the active-agent count.
+            actor_loss = (
+                actor_loss_per_agent.sum()
+                / valid_agent_mask.sum().clamp_min(1.0)
+            )
+
+            value_err = (value_pred - returns) ** 2
+            critic_loss = (value_err * active_mask).sum() / active_mask.sum().clamp_min(1.0)
+
+            entropy_mean = (entropy * valid_agent_mask).sum() / valid_agent_mask.sum().clamp_min(1.0)
+            pi_loss = actor_loss - entropy_coef * entropy_mean
+            q_loss = value_coef * critic_loss
+
+            self.alloc_pi_optimiser.zero_grad()
+            pi_loss.backward()
+            pi_grad_norm = th.nn.utils.clip_grad_norm_(self.alloc_pi_params, self.args.grad_norm_clip)
+            self.alloc_pi_optimiser.step()
+
+            self.alloc_q_optimiser.zero_grad()
+            q_loss.backward()
+            q_grad_norm = th.nn.utils.clip_grad_norm_(self.alloc_q_params, self.args.grad_norm_clip)
+            self.alloc_q_optimiser.step()
+
+        with th.no_grad():
+            approx_kl = ((old_log_probs - new_log_probs) * valid_agent_mask).sum() / valid_agent_mask.sum().clamp_min(1.0)
+            clip_frac = ((th.abs(ratio - 1.0) > eps_clip).float() * valid_agent_mask).sum() / valid_agent_mask.sum().clamp_min(1.0)
+            task_valid = 1.0 - meta_batch["task_mask"].float()
+            alloc_counts = alloc_onehot.sum(dim=1)
+            selected_task_mask = (alloc_counts > 0).float() * task_valid
+            valid_task_count = task_valid.sum(dim=1).clamp_min(1.0)
+            covered = selected_task_mask.sum(dim=1)
+            duplicate_tasks = ((alloc_counts > 1).float() * task_valid).sum(dim=1)
+            duplicate_denom = selected_task_mask.sum(dim=1).clamp_min(1.0)
+
+            segment_lengths = meta_batch["segment_length"][active_mask.bool()]
+            if segment_lengths.numel() > 0:
+                max_segment_length = int(self.args.hier_agent["action_length"])
+                stats["segment_length/mean"] = segment_lengths.mean().item()
+                stats["segment_length/std"] = segment_lengths.std(unbiased=False).item()
+                stats["segment_length/min"] = segment_lengths.min().item()
+                stats["segment_length/max"] = segment_lengths.max().item()
+                stats["segment_length/early_end_fraction"] = (
+                    segment_lengths < max_segment_length
+                ).float().mean().item()
+                for length in range(1, max_segment_length + 1):
+                    stats["segment_length/length_{}_fraction".format(length)] = (
+                        segment_lengths == length
+                    ).float().mean().item()
+
+            stats["losses/alloc_mappo_actor"] = actor_loss.item()
+            stats["losses/alloc_mappo_critic"] = critic_loss.item()
+            stats["losses/alloc_mappo_entropy"] = entropy_mean.item()
+            stats["alloc_metrics/adv_std"] = adv_var.sqrt().item()
+            stats["alloc_metrics/return_target_mean"] = ((returns * active_mask).sum() / active_mask.sum().clamp_min(1.0)).item()
+            stats["alloc_metrics/value_mean"] = ((value_pred * active_mask).sum() / active_mask.sum().clamp_min(1.0)).item()
+            stats["alloc_metrics/alloc_kl"] = approx_kl.item()
+            stats["alloc_metrics/alloc_clip_frac"] = clip_frac.item()
+            stats["alloc_metrics/ratio_max"] = ratio[valid_agent_mask.bool()].max().item() if valid_agent_mask.bool().any() else 0.0
+            stats["alloc_metrics/ratio_min"] = ratio[valid_agent_mask.bool()].min().item() if valid_agent_mask.bool().any() else 0.0
+            stats["alloc_metrics/task_coverage_ratio"] = (covered / valid_task_count).mean().item()
+            stats["alloc_metrics/duplicate_task_ratio"] = (duplicate_tasks / duplicate_denom).mean().item()
+            task_load_mean = (alloc_counts * task_valid).sum(dim=1, keepdim=True) / valid_task_count.unsqueeze(1)
+            stats["alloc_metrics/task_load_std"] = (((alloc_counts - task_load_mean) * task_valid) ** 2).sum(dim=1).div(valid_task_count).sqrt().mean().item()
+            stats["alloc_debug/active_agent_count"] = (
+                agent_mask.squeeze(-1).sum(dim=1).mean().item()
+            )
+            for key, value in pi_eval.items():
+                if key.startswith("iga_"):
+                    stats["alloc_iga/{}".format(key)] = value.detach().mean().item()
+                elif key.startswith("alloc_counterfactual/"):
+                    stats[key] = value.detach().mean().item()
+            stats["train_metrics/alloc_pi_grad_norm"] = pi_grad_norm
+            stats["train_metrics/alloc_q_grad_norm"] = q_grad_norm
+
+        if t_env - self.log_alloc_stats_t >= self.args.learner_log_interval:
+            for name, value in stats.items():
+                self.logger.log_stat(name, value, t_env)
+            self.log_alloc_stats_t = t_env
+        return stats
 
     def alloc_train_aql(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         meta_batch = self._make_meta_batch(batch)
@@ -511,4 +1084,7 @@ class QLearner:
         if not evaluate and not pi_only:
             if self.mixer is not None:
                 self.mixer.load_state_dict(th.load("{}mixer.th".format(path), map_location=lambda storage, loc: storage))
+                self.target_mixer.load_state_dict(
+                    th.load("{}mixer.th".format(path), map_location=lambda storage, loc: storage)
+                )
             self.optimiser.load_state_dict(th.load("{}opt.th".format(path), map_location=lambda storage, loc: storage))

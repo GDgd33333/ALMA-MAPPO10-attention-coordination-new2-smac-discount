@@ -23,6 +23,7 @@ wandb_ignore_params = [
     'save_model_interval',
     'checkpoint_run_name',
     'pi_checkpoint_run_name',
+    'checkpoint_path',
     'evaluate',
     'load_step',
     'save_replay',
@@ -47,7 +48,7 @@ wandb_ignore_params = [
 
 def main(config):
     # Setting the random seed throughout the modules
-    config['seed'] = np.random.randint(999999)
+    config['seed'] = config.get('resume_seed', 0) or np.random.randint(999999)
     np.random.seed(config["seed"])
     th.manual_seed(config["seed"])
     config['env_args']['seed'] = config["seed"]

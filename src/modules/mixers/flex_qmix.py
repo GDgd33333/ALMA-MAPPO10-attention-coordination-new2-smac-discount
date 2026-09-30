@@ -174,6 +174,10 @@ class FlexQMixer(nn.Module):
             targ_rms_state_dict, state_dict = state_dict
             self.targ_rms.load_state_dict(targ_rms_state_dict)
         super().load_state_dict(state_dict)
+        if self.use_popart and self.targ_rms._mean is not None:
+            device = self.popart_weight.device
+            self.targ_rms._mean = self.targ_rms._mean.to(device)
+            self.targ_rms._var = self.targ_rms._var.to(device)
 
     def state_dict(self):
         if self.use_popart:
