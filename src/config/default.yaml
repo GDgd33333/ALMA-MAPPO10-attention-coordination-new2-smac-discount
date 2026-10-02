@@ -85,6 +85,7 @@ hier_agent:
   gamma_high: 0.99  # per-environment-step discount for duration-aware high-level SMDP returns
   gae_lambda: 0.95  # GAE lambda on high-level timescale
   ppo_update_interval: 1  # high-level PPO update every N episodes (1 = same frequency as low-level training loop)
+  iga_use_probabilistic_intention: True  # False keeps IAGA but hides learned base-policy preferences
   max_bs: 400  # max batch size for alloc training (lower action_length will result in higher batch size which may overflow memory)
   pi_ag_attn: False
   subtask_mask: True

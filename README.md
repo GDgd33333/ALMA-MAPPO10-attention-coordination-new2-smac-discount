@@ -342,6 +342,19 @@ To disable a specific graph inside IAGA:
 --hier_agent.iga_use_agent_task_graph=False
 ```
 
+To keep all IAGA graph modules while hiding the base policy's probabilistic
+task intention from the refiner:
+
+```bash
+--hier_agent.iga_use_probabilistic_intention=False
+```
+
+This controlled ablation replaces each agent's learned task distribution with
+a uniform distribution over its currently valid tasks and zeros the direct
+base-logit feature supplied to the Agent-Task relation head. The real base
+logits are still used in the final residual update, so the base actor and the
+graph architecture remain intact.
+
 `iga_use_agent_task_graph=False` is a controlled Agent-Task relation
 ablation rather than another alias for `use_iga=False`. It keeps the
 Agent-Agent and Task-Task graph encoders and the bounded residual update, but

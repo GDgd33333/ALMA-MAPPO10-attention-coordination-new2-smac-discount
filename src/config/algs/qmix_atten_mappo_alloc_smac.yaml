@@ -69,6 +69,7 @@ hier_agent:
   # edge features with an agent-wise non-relational residual MLP.
   iga_use_agent_task_graph: True
   iga_use_task_load: True
+  iga_use_probabilistic_intention: True
   iga_dropout: 0.0
   iga_debug_checks: False
 

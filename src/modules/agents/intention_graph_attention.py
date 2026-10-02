@@ -34,6 +34,9 @@ class IntentionGraphAttentionRefinement(nn.Module):
         self.use_task_graph = bool(cfg.get("iga_use_task_graph", True))
         self.use_agent_task_graph = bool(cfg.get("iga_use_agent_task_graph", True))
         self.use_task_load = bool(cfg.get("iga_use_task_load", True))
+        self.use_probabilistic_intention = bool(
+            cfg.get("iga_use_probabilistic_intention", True)
+        )
         self.dropout = float(cfg.get("iga_dropout", 0.0))
         self.debug_checks = bool(cfg.get("iga_debug_checks", False))
         if self.hidden_dim % self.num_heads != 0:
@@ -243,7 +246,28 @@ class IntentionGraphAttentionRefinement(nn.Module):
             base_logits.masked_fill(pair_task_mask, -1e10)
             if pair_task_mask is not None else base_logits
         )
-        agent_intention = masked_softmax(base_logits, pair_task_mask, dim=-1)
+        if self.use_probabilistic_intention:
+            # Full HIAGA: expose the base actor's complete task distribution
+            # to the graph refiner as its probabilistic intention.
+            agent_intention = masked_softmax(base_logits, pair_task_mask, dim=-1)
+            relation_logit_features = base_logits
+        else:
+            # Controlled no-intention ablation: retain the complete graph
+            # architecture and valid-task information, but hide all learned
+            # base-policy preferences from the refiner. Uniform mass over
+            # valid tasks is a neutral, well-formed probability distribution.
+            valid_task_for_agent = (
+                th.ones_like(base_logits)
+                if pair_task_mask is None
+                else (~pair_task_mask).to(base_logits.dtype)
+            )
+            valid_task_count = valid_task_for_agent.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            agent_intention = valid_task_for_agent / valid_task_count
+
+            # base_logits also reveal the same preference information through
+            # the Agent-Task relation head, so remove that input as well. The
+            # final residual update below still uses the real base_logits.
+            relation_logit_features = th.zeros_like(base_logits)
         agent_intention = agent_intention * agent_active.unsqueeze(-1)
 
         agent_proj = self.agent_proj(agent_embed)
@@ -306,7 +330,7 @@ class IntentionGraphAttentionRefinement(nn.Module):
                     task_pair,
                     task_ctx_pair,
                     load_pair,
-                    base_logits.unsqueeze(-1),
+                    relation_logit_features.unsqueeze(-1),
                 ],
                 dim=-1,
             )
@@ -324,8 +348,8 @@ class IntentionGraphAttentionRefinement(nn.Module):
                 -1, base_logits.shape[1], -1
             )
             base_logit_features = (
-                base_logits.masked_fill(pair_task_mask, 0.0)
-                if pair_task_mask is not None else base_logits
+                relation_logit_features.masked_fill(pair_task_mask, 0.0)
+                if pair_task_mask is not None else relation_logit_features
             )
             nonrelational_features = th.cat(
                 [agent_context, pooled_task_context, base_logit_features],
@@ -354,6 +378,9 @@ class IntentionGraphAttentionRefinement(nn.Module):
 
         task_load_flat = task_load.squeeze(-1)
         stats = {
+            "iga_probabilistic_intention_enabled": base_logits.new_tensor(
+                float(self.use_probabilistic_intention)
+            ).detach(),
             "iga_delta_abs_mean": bounded_delta.abs().mean().detach(),
             "iga_delta_std": bounded_delta.std().detach(),
             "iga_delta_task_std_mean": bounded_delta.std(dim=-1).mean().detach(),
